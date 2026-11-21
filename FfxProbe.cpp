@@ -1,0 +1,964 @@
+// FusionGL - FSR3 帧生成（P0 探测 + P1 每帧插值）
+// 受 MOBILEGL_FFX_PROBE 编译开关 + /sdcard/FusionGL/ffx_probe.on 运行时开关控制。
+#include "FfxProbe.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <chrono>
+#include <vector>
+
+#include <android/log.h>
+
+#include "ffx_vk_fsr3_3_1_5_bridge.h"
+#include "ffx_vk_fsr3_3_1_5_upscaler.h"
+#include "fusion_sr_upsample_spv.h"
+#include "fusion_sr_sharpen_spv.h"
+
+#define FFX_PROBE_FILE "/sdcard/FusionGL/ffx_probe.log"
+#define FFXLOG(...)                                                       \
+    do {                                                                  \
+        std::printf(__VA_ARGS__);                                         \
+        std::fflush(stdout);                                              \
+        __android_log_print(ANDROID_LOG_INFO, "FusionGL", __VA_ARGS__);   \
+        if (FILE* _fp = std::fopen(FFX_PROBE_FILE, "a")) {                \
+            std::fprintf(_fp, __VA_ARGS__);                               \
+            std::fputc('\n', _fp);                                        \
+            std::fclose(_fp);                                             \
+        }                                                                 \
+    } while (0)
+
+    // 日志模式: 正式版默认静默(超分/插帧问题只打一行提示, 详细排查用测试版)。
+    // FUSION_LOG_MODE=full 恢复全量日志。
+    static int ffxLogMode() {
+        static int m = -1;
+        if (m < 0) { const char* e = std::getenv("FUSION_LOG_MODE"); m = (e && std::strcmp(e, "full") == 0) ? 1 : 0; }
+        return m;
+    }
+    static void ffxQuietLog(const char* fmt, ...) {
+        if (ffxLogMode() == 1) return;  // full 模式由 FFXLOG 负责原样输出
+        char buf[512]; va_list ap; va_start(ap, fmt);
+        std::vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+        if (FILE* fp = std::fopen("/sdcard/FusionGL/ffx_probe.log", "a")) {
+            std::fprintf(fp, "%s\n", buf); std::fclose(fp);
+        }
+    }
+
+namespace MobileGL::MG_Backend::DirectVulkan {
+    bool g_fgContextReady = false;
+    bool g_fgPresentEnabled = false;
+
+    void FfxDiagLog(const char* fmt, ...) {
+        char buf[512];
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        __android_log_print(ANDROID_LOG_INFO, "FusionGL", "%s", buf);
+        if (FILE* fp = std::fopen("/sdcard/FusionGL/ffx_probe.log", "a")) {
+            std::fputs(buf, fp);
+            std::fputc('\n', fp);
+            std::fclose(fp);
+        }
+    }
+
+    // 延迟释放的待处理帧号（0 = 无）。SDK 要求 imported 图保留到 GPU 执行完，
+    // 因此 dispatch 成功后先记号，下一帧进入时（fence 已保证完成）才真正释放。
+    uint64_t s_pendingRetireId = 0u;
+
+    // 超分上下文（P0 常驻；P1 dispatch 接入后再启用每帧重建）
+    FfxVkFsr3_3_1_5UpscalerContext* g_upscaleContext = nullptr;
+    bool g_upscaleReady = false;
+
+    namespace {
+        bool g_probeDone = false;
+        bool g_hookSeen = false;
+        FfxVkFsr3_3_1_6FrameGenerationContext* g_fgContext = nullptr;
+        VkDevice g_device = VK_NULL_HANDLE;
+        VkPhysicalDevice g_physicalDevice = VK_NULL_HANDLE;
+        VkFormat g_colorFormat = VK_FORMAT_UNDEFINED;   // FSR3 内部统一 RGBA8
+        VkFormat g_swapchainFormat = VK_FORMAT_UNDEFINED; // 真实屏幕格式（可能 10bit）
+        uint32_t g_width = 0, g_height = 0;
+
+        struct Img { VkImage image = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; };
+        Img g_depth, g_motion, g_output;   // R32F depth, R16G16 dummy MV, RGBA8 output
+        Img g_colorIn;                     // RGBA8：swapchain color 的中转副本
+        bool g_resReady = false;
+
+        uint32_t find_mem_type(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags want) {
+            VkPhysicalDeviceMemoryProperties mp{};
+            vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+            for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+                if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
+            return UINT32_MAX;
+        }
+
+        bool make_img(VkDevice dev, VkPhysicalDevice pd, uint32_t w, uint32_t h,
+                      VkFormat fmt, VkImageUsageFlags usage, Img& out, const char* tag) {
+            VkImageCreateInfo ci{};
+            ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            ci.imageType = VK_IMAGE_TYPE_2D;
+            ci.format = fmt; ci.extent = {w, h, 1}; ci.mipLevels = 1; ci.arrayLayers = 1;
+            ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ci.usage = usage; ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            if (vkCreateImage(dev, &ci, nullptr, &out.image) != VK_SUCCESS) {
+                ffxQuietLog("[FFX-P1] createImage fail %s", tag); return false;
+            }
+            VkMemoryRequirements mr{}; vkGetImageMemoryRequirements(dev, out.image, &mr);
+            VkMemoryAllocateInfo ai{}; ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            ai.allocationSize = mr.size;
+            ai.memoryTypeIndex = find_mem_type(pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (ai.memoryTypeIndex == UINT32_MAX ||
+                vkAllocateMemory(dev, &ai, nullptr, &out.mem) != VK_SUCCESS) {
+                ffxQuietLog("[FFX-P1] allocMem fail %s", tag); vkDestroyImage(dev, out.image, nullptr);
+                out.image = VK_NULL_HANDLE; return false;
+            }
+            vkBindImageMemory(dev, out.image, out.mem, 0);
+            return true;
+        }
+
+        void ProbeDerivativeCaps(VkPhysicalDevice physicalDevice) {
+            const char* file = "/sdcard/FusionGL/ffx_caps.log";
+            std::FILE* f = std::fopen(file, "w");
+            if (!f) return;
+            bool extFound = false;
+            uint32_t extCount = 0;
+            if (vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr) == VK_SUCCESS) {
+                std::vector<VkExtensionProperties> exts(extCount);
+                if (vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, exts.data()) == VK_SUCCESS) {
+                    for (const auto& e : exts) {
+                        if (std::strcmp(e.extensionName, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) == 0) {
+                            extFound = true; break;
+                        }
+                    }
+                }
+            }
+            std::fprintf(f, "VK_KHR_compute_shader_derivatives extension: %s\n", extFound ? "YES" : "NO");
+            std::fclose(f);
+        }
+    }
+
+    VkImage FfxFramegenDepthImage() { return g_depth.image; }
+    VkImage FfxFramegenMotionImage() { return g_motion.image; }
+    VkImage FfxFramegenOutputImage() { return g_output.image; }
+    VkImage FfxFramegenColorInImage() { return g_colorIn.image; }
+    VkFormat FfxFramegenColorFormat() { return VK_FORMAT_R8G8B8A8_UNORM; }
+
+    float FfxUpscaleFactor() {
+        static float cached = -1.0f;
+        if (cached < 0.0f) {
+            const char* env = std::getenv("FUSION_UPSCALE_PCT");
+            const int pct = env ? std::atoi(env) : 100;
+            cached = (pct > 0 && pct < 100) ? static_cast<float>(pct) / 100.0f : 1.0f;
+        }
+        return cached;
+    }
+
+    bool FfxProbeMaybeRun(VkPhysicalDevice physicalDevice, VkDevice device,
+                          VkFormat colorFormat, uint32_t width, uint32_t height) {
+        if (!g_hookSeen) {
+            g_hookSeen = true;
+            const char* env = std::getenv("MOBILEGL_FFX_PROBE");
+            ffxQuietLog("[FFX-P0] hook reached: env=%s size=%ux%u fmt=%d",
+                   env ? env : "(unset)", width, height, static_cast<int>(colorFormat));
+        }
+        if (g_probeDone) return false;
+        if (std::getenv("MOBILEGL_FFX_PROBE") == nullptr) return false;
+        g_probeDone = true;
+        // 是否把插值帧真正呈现到屏幕上：由启动器里的「帧生成」选项决定。
+        // 该选项的取值形如「关 / 2倍 / 3倍 / 4倍」，只有含「倍」才启用呈现。
+        if (const char* fgEnv = std::getenv("FUSION_FG_MULT")) {
+            g_fgPresentEnabled = std::strstr(fgEnv, "倍") != nullptr;
+            ffxQuietLog("[FFX-P2] present enabled=%d (FUSION_FG_MULT=%s)",
+                   g_fgPresentEnabled ? 1 : 0, fgEnv);
+        }
+        if (physicalDevice == VK_NULL_HANDLE || device == VK_NULL_HANDLE || width == 0 || height == 0)
+            return false;
+
+        ProbeDerivativeCaps(physicalDevice);
+
+        FfxVkFsr3_3_1_6FrameGenerationCreateInfo createInfo{};
+        createInfo.physicalDevice = physicalDevice;
+        createInfo.device = device;
+        createInfo.maxRenderWidth = width; createInfo.maxRenderHeight = height;
+        createInfo.displayWidth = width; createInfo.displayHeight = height;
+        // FSR3 只支持 R8G8B8A8_UNORM / R16G16B16A16_SFLOAT 两种颜色格式。
+        // 本机 swapchain 是 10bit（A2B10G10R10），绝不能直接喂给 FSR3 —— 否则 dispatch
+        // 写出来的是一张黑图，present 后表现为“正常帧 -> 黑帧 -> 正常帧”的闪烁。
+        // 因此内部统一用 RGBA8：进入前把 swapchain 拷成 RGBA8，出来后 blit 回 swapchain。
+        createInfo.colorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        ffxQuietLog("[FFX-P1] internal color format forced to R8G8B8A8_UNORM (swapchain fmt=%d)",
+               static_cast<int>(colorFormat));
+
+        FfxVkFsr3_3_1_6FrameGenerationContext* ctx = nullptr;
+        const FfxVkFsr3_3_1_6FrameGenerationResult rc =
+            ffxVkFsr3_3_1_6FrameGenerationContextCreate(&createInfo, &ctx);
+        ffxQuietLog("[FFX-P0] create rc=%d ctx=%p", static_cast<int>(rc), static_cast<void*>(ctx));
+        if (rc != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK || ctx == nullptr) {
+            ffxQuietLog("[FFX-P0] RESULT=FAIL rc=%d", static_cast<int>(rc));
+            return true;
+        }
+        g_fgContext = ctx; g_device = device; g_physicalDevice = physicalDevice;
+        g_colorFormat = VK_FORMAT_R8G8B8A8_UNORM; g_swapchainFormat = colorFormat;
+        g_width = width; g_height = height;
+
+        const VkImageUsageFlags sampled = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        bool ok = true;
+        ok &= make_img(device, physicalDevice, width, height, VK_FORMAT_R32_SFLOAT, sampled, g_depth, "depth");
+        ok &= make_img(device, physicalDevice, width, height, VK_FORMAT_R16G16_SFLOAT, sampled, g_motion, "motion");
+        // 进入 FSR3 前的 RGBA8 中转图（由 swapchain 图 blit 过来）；
+        // 拉伸回全屏时它也是 blit 源，因此需要 TRANSFER_SRC。
+        ok &= make_img(device, physicalDevice, width, height, VK_FORMAT_R8G8B8A8_UNORM,
+                       sampled | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_colorIn, "colorIn");
+        ok &= make_img(device, physicalDevice, width, height, VK_FORMAT_R8G8B8A8_UNORM,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_output, "output");
+        g_resReady = ok;
+        g_fgContextReady = ok;
+        ffxQuietLog("[FFX-P1] resources %s (depth/motion/output %ux%u)", ok ? "READY" : "FAILED", width, height);
+
+        // ---- FusionGL 超分 P0：FSR3 upscaler 上下文创建（照帧生成成功路径） ----
+        // 渲染分辨率 = 缩放区域（FUSION_UPSCALE_PCT），重建目标 = 全屏。
+        // 上下文常驻（与帧生成同款），创建失败静默降级（超分不生效，渲染照常）。
+        do {
+            const char* pctEnv = std::getenv("FUSION_UPSCALE_PCT");
+            const int pct = pctEnv ? std::atoi(pctEnv) : 100;
+            if (pct <= 0 || pct >= 100) break; // 100% 时超分无意义
+            FfxVkFsr3_3_1_5UpscalerCreateInfo usInfo{};
+            usInfo.physicalDevice = physicalDevice;
+            usInfo.device = device;
+            usInfo.maxRenderWidth = width;  usInfo.maxRenderHeight = height;
+            usInfo.maxUpscaleWidth = width; usInfo.maxUpscaleHeight = height;
+            usInfo.hdrColorInput = VK_FALSE;
+            usInfo.autoExposure = VK_TRUE;
+            FfxVkFsr3_3_1_5UpscalerContext* usCtx = nullptr;
+            const FfxVkFsr3_3_1_5Result usRc = ffxVkFsr3_3_1_5UpscalerContextCreate(&usInfo, &usCtx);
+            ffxQuietLog("[FFX-UP] upscaler create rc=%d ctx=%p (render<=%ux%u upscale<=%ux%u)",
+                   static_cast<int>(usRc), static_cast<void*>(usCtx), width, height, width, height);
+            if (usRc == FFX_VK_FSR3_3_1_5_OK && usCtx != nullptr) {
+                FfxVkFsr3_3_1_5MemoryUsage usMem{};
+                if (ffxVkFsr3_3_1_5UpscalerContextGetMemoryUsage(usCtx, &usMem) ==
+                    FFX_VK_FSR3_3_1_5_OK) {
+                    ffxQuietLog("[FFX-UP] upscaler resident %.1f MB",
+                           static_cast<double>(usMem.totalUsageInBytes) / (1024.0 * 1024.0));
+                }
+                g_upscaleContext = usCtx;
+                g_upscaleReady = true;
+            } else {
+                ffxQuietLog("[FFX-UP] RESULT=FAIL rc=%d (upscale disabled, rendering unaffected)",
+                       static_cast<int>(usRc));
+            }
+        } while (false);
+
+        ffxQuietLog("[FFX-P0] RESULT=OK (context kept resident for P1)");
+        return true;
+    }
+
+    bool FfxFramegenRecord(VkCommandBuffer commandBuffer,
+                           VkImage colorImage, VkFormat colorFormat,
+                           VkImage depthImage, VkImage motionImage, VkImage outputImage,
+                           uint32_t displayWidth, uint32_t displayHeight,
+                           uint32_t renderWidth, uint32_t renderHeight,
+                           uint64_t frameId, bool reset) {
+        if (g_fgContext == nullptr || commandBuffer == VK_NULL_HANDLE) return false;
+        // 延迟释放的兑现点：此刻上一帧的提交已被 FrameContext 的 slot fence 等待完成，
+        // GPU 已经真正跑完，SDK 引用的 imported 图此刻释放才安全。
+        if (s_pendingRetireId != 0u) {
+            ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(g_fgContext, s_pendingRetireId);
+            s_pendingRetireId = 0u;
+        }
+        VkImage depth = depthImage != VK_NULL_HANDLE ? depthImage : g_depth.image;
+        VkImage motion = motionImage != VK_NULL_HANDLE ? motionImage : g_motion.image;
+        VkImage output = outputImage != VK_NULL_HANDLE ? outputImage : g_output.image;
+        if (colorImage == VK_NULL_HANDLE || depth == VK_NULL_HANDLE ||
+            motion == VK_NULL_HANDLE || output == VK_NULL_HANDLE) return false;
+        if (renderWidth == 0 || renderHeight == 0) return false;
+
+        // 关键：FSR3 的图和 context 是按创建时的尺寸建的。swapchain 一旦重建（加载完成、
+        // 窗口尺寸变化），调用方传来的 display 尺寸就会变，若直接使用会导致 prepare 每一帧
+        // 都返回 INVALID_ARGUMENT（尺寸校验不过）。这里强制用 context 自己的尺寸，
+        // 尺寸不一致时让 blit 做缩放，绝不把不匹配的参数喂给 FSR3。
+        const uint32_t ctxW = g_width != 0 ? g_width : displayWidth;
+        const uint32_t ctxH = g_height != 0 ? g_height : displayHeight;
+        static uint32_t s_mismatchLogged = 0;
+        if ((displayWidth != ctxW || displayHeight != ctxH) && s_mismatchLogged < 3) {
+            ++s_mismatchLogged;
+            ffxQuietLog("[FFX-P1] size mismatch display=%ux%u ctx=%ux%u -> using ctx size",
+                   displayWidth, displayHeight, ctxW, ctxH);
+        }
+        displayWidth = ctxW; displayHeight = ctxH;
+        renderWidth = ctxW; renderHeight = ctxH;
+
+        // 避坑（别人的实测教训）：帧间隔 >100ms（加载/暂停/卡顿）或尺寸变化时必须
+        // reset SDK 历史，否则光流基于失效的历史帧产生伪影/错乱。
+        static std::chrono::steady_clock::time_point s_lastRecord{};
+        const auto recordNow = std::chrono::steady_clock::now();
+        bool forceReset = reset;
+        if (s_lastRecord.time_since_epoch().count() != 0 &&
+            recordNow - s_lastRecord > std::chrono::milliseconds(100)) {
+            forceReset = true;
+            ffxQuietLog("[FFX-DIAG] >100ms frame gap -> forcing history reset");
+        }
+        if (displayWidth != g_width || displayHeight != g_height) {
+            forceReset = true;
+            ffxQuietLog("[FFX-DIAG] display size changed -> forcing history reset");
+        }
+        s_lastRecord = recordNow;
+
+        const VkImageUsageFlags sampledStorage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+
+        FfxVkFsr3_3_1_6FrameGenerationImage color{};
+        color.image = colorImage; color.format = colorFormat;
+        color.width = displayWidth; color.height = displayHeight;
+        color.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        color.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+
+        FfxVkFsr3_3_1_6FrameGenerationImage dep{};
+        dep.image = depth; dep.format = VK_FORMAT_R32_SFLOAT;
+        dep.width = renderWidth; dep.height = renderHeight;
+        dep.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; dep.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+
+        FfxVkFsr3_3_1_6FrameGenerationImage mv{};
+        mv.image = motion; mv.format = VK_FORMAT_R16G16_SFLOAT;
+        mv.width = renderWidth; mv.height = renderHeight;
+        mv.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; mv.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+
+        FfxVkFsr3_3_1_6FrameGenerationImage out{};
+        out.image = output; out.format = colorFormat;
+        out.width = displayWidth; out.height = displayHeight;
+        out.layout = VK_IMAGE_LAYOUT_GENERAL; out.usage = sampledStorage;
+
+        FfxVkFsr3_3_1_6FrameGenerationPrepareInfo prep{};
+        prep.commandBuffer = commandBuffer;
+        prep.color = color; prep.depth = dep; prep.motionVectors = mv;
+        prep.renderWidth = renderWidth; prep.renderHeight = renderHeight;
+        prep.jitterOffsetX = 0.0f; prep.jitterOffsetY = 0.0f;
+        prep.motionVectorScaleX = static_cast<float>(renderWidth);
+        prep.motionVectorScaleY = static_cast<float>(renderHeight);
+        prep.frameTimeMilliseconds = 16.6667f;
+        prep.minLuminance = 0.0f; prep.maxLuminance = 100.0f;
+        prep.transferFunction = FFX_VK_FSR3_3_1_6_FRAMEGEN_TRANSFER_SRGB;
+        prep.cameraNear = 0.05f; prep.cameraFar = 1000.0f;
+        prep.viewSpaceToMeters = 1.0f; prep.cameraVerticalFovRadians = 1.22173f;
+        prep.cameraUp[1] = 1.0f; prep.cameraRight[0] = 1.0f; prep.cameraForward[2] = -1.0f;
+        prep.frameId = frameId; prep.reset = forceReset ? VK_TRUE : VK_FALSE;
+
+        FfxVkFsr3_3_1_6FrameGenerationResult pr =
+            ffxVkFsr3_3_1_6FrameGenerationContextRecordPrepare(g_fgContext, &prep);
+        if (pr != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+            // 状态卡死自救：如果卡在 "previous frame stuck in prepared state"，
+            // 强制 RetireFrame 清掉残留状态（释放 pendingImports、清 prepared/
+            // dispatched），然后重试一次。没有这个自救，一次异常就会永久毁掉插帧。
+            const uint64_t stuckFrameId =
+                ffxVkFsr3_3_1_6FrameGenerationContextPeekFrameId(g_fgContext);
+            if (stuckFrameId != 0u) {
+                ffxQuietLog("[FFX-P1] prepare fail frame=%llu rc=%d -> force retire (ctx frame %llu) and retry",
+                       (unsigned long long)frameId, (int)pr,
+                       (unsigned long long)stuckFrameId);
+                ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(g_fgContext, stuckFrameId);
+                pr = ffxVkFsr3_3_1_6FrameGenerationContextRecordPrepare(g_fgContext, &prep);
+                if (pr == FFX_VK_FSR3_3_1_6_FRAMEGEN_OK)
+                    ffxQuietLog("[FFX-P1] prepare recovered after forced retire (frame=%llu)",
+                           (unsigned long long)frameId);
+            }
+            if (pr != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+                ffxQuietLog("[FFX-P1] prepare fail frame=%llu rc=%d (unrecoverable this frame)",
+                       (unsigned long long)frameId, (int)pr);
+                return false;
+            }
+        }
+
+        FfxVkFsr3_3_1_6FrameGenerationDispatchInfo disp{};
+        disp.commandBuffer = commandBuffer;
+        disp.color = color; disp.output = out;
+        disp.displayWidth = displayWidth; disp.displayHeight = displayHeight;
+        disp.frameTimeMilliseconds = 16.6667f;
+        disp.cameraNear = 0.05f; disp.cameraFar = 1000.0f;
+        disp.viewSpaceToMeters = 1.0f; disp.cameraVerticalFovRadians = 1.22173f;
+        disp.minLuminance = 0.0f; disp.maxLuminance = 100.0f;
+        disp.transferFunction = FFX_VK_FSR3_3_1_6_FRAMEGEN_TRANSFER_SRGB;
+        disp.frameId = frameId; disp.reset = forceReset ? VK_TRUE : VK_FALSE;
+
+        const FfxVkFsr3_3_1_6FrameGenerationResult dr =
+            ffxVkFsr3_3_1_6FrameGenerationContextRecordDispatch(g_fgContext, &disp);
+        if (dr != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+            ffxQuietLog("[FFX-P1] dispatch fail frame=%llu rc=%d", (unsigned long long)frameId, (int)dr);
+            return false;
+        }
+        // 延迟释放（关键修复）：SDK 要求 imported 图保留到"命令缓冲在 GPU 上执行完之后"。
+        // 之前在这里（录制刚结束、GPU 还没跑）就 RetireFrame，会把 SDK 下一帧要引用的
+        // 资源句柄提前释放 —— 表现为运行一段时间后 SDK 持续返回 BACKEND_API_ERROR(0x8000000D)。
+        // 现在记下待释放帧号；下一帧进入本函数时上一帧的 slot fence 已由 FrameContext
+        // 等待完成，此时释放才是安全的。
+        s_pendingRetireId = frameId;
+        static uint64_t s_ok = 0; ++s_ok;
+        if (s_ok == 1 || (s_ok % 120) == 0)
+            ffxQuietLog("[FFX-P1] generated %llu frames ok", (unsigned long long)s_ok);
+        return true;
+    }
+
+    // ---------------- P2b：同一次提交内完成插值帧拷贝（零 CPU 阻塞） ----------------
+    // 这是"原始帧跑满"的关键：插值帧的拷贝必须和本帧渲染在同一次 vkQueueSubmit 里完成，
+    // CPU 才不会为了等 GPU 把本帧画完而阻塞。阻塞会让游戏渲染掉帧，插帧收益被抵消。
+    // 这里 acquire 第二张 swapchain 图时用 0 超时 —— 没图就这一帧不插，绝不阻塞。
+    namespace {
+        constexpr uint32_t kInterpSemCount = 4;
+        struct InterpTarget {
+            VkSemaphore acquireSems[kInterpSemCount]{};
+            VkSemaphore finishedSems[kInterpSemCount]{};
+            uint32_t cursor = 0;
+            bool tried = false;
+            bool ok = false;
+        };
+        InterpTarget g_it;
+        uint64_t g_intOk = 0, g_intFail = 0;
+
+        bool ensure_interp_sems(VkDevice device) {
+            if (g_it.tried) return g_it.ok;
+            g_it.tried = true;
+            VkSemaphoreCreateInfo sci{};
+            sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            bool ok = true;
+            for (uint32_t i = 0; i < kInterpSemCount; ++i) {
+                if (vkCreateSemaphore(device, &sci, nullptr, &g_it.acquireSems[i]) != VK_SUCCESS) {
+                    ok = false;
+                    ffxQuietLog("[FFX-DIAG] interp acquire semaphore #%u create FAILED", i);
+                }
+                if (vkCreateSemaphore(device, &sci, nullptr, &g_it.finishedSems[i]) != VK_SUCCESS) {
+                    ok = false;
+                    ffxQuietLog("[FFX-DIAG] interp finished semaphore #%u create FAILED", i);
+                }
+            }
+            g_it.ok = ok;
+            if (!ok) ffxQuietLog("[FFX-DIAG] interp semaphores incomplete -> frame gen present DISABLED");
+            return ok;
+        }
+    }
+
+    bool FfxAcquireInterpTarget(VkDevice device, VkSwapchainKHR swapchain,
+                                const VkImage* swapchainImages, uint32_t imageCount,
+                                uint32_t mainImageIndex, VkImage* outImage, uint32_t* outIndex,
+                                VkSemaphore* outAcquire, VkSemaphore* outFinished) {
+        if (!g_resReady || !g_fgPresentEnabled) {
+            static unsigned s_nr = 0; ++s_nr;
+            if (s_nr <= 3 || (s_nr % 300) == 0)
+                ffxQuietLog("[FFX-DIAG] acquire skip: resReady=%d presentEnabled=%d (#%u)",
+                       g_resReady ? 1 : 0, g_fgPresentEnabled ? 1 : 0, s_nr);
+            return false;
+        }
+        if (device == VK_NULL_HANDLE || swapchain == VK_NULL_HANDLE ||
+            swapchainImages == nullptr || imageCount == 0) {
+            static unsigned s_ni = 0; ++s_ni;
+            if (s_ni <= 5 || (s_ni % 30) == 0)
+                ffxQuietLog("[FFX-DIAG] acquire skip: bad inputs dev=%p sc=%p imgs=%p cnt=%u (#%u)",
+                       (void*)device, (void*)swapchain, (void*)swapchainImages, imageCount, s_ni);
+            return false;
+        }
+        if (!ensure_interp_sems(device)) return false;
+
+        const uint32_t slot = g_it.cursor;
+        uint32_t idx = 0;
+        // 0 超时：没有空闲图就这一帧不插，绝不阻塞主线程。
+        const VkResult ar = vkAcquireNextImageKHR(device, swapchain, 0ull,
+                                                 g_it.acquireSems[slot], VK_NULL_HANDLE, &idx);
+        if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+            ++g_intFail;
+            if (g_intFail <= 5 || (g_intFail % 30) == 0)
+                ffxQuietLog("[FFX-DIAG] interp acquire skip rc=%d slot=%u (skip=%llu) "
+                       "[VK_NOT_READY=-2=queue full is normal]",
+                       static_cast<int>(ar), slot, (unsigned long long)g_intFail);
+            return false;
+        }
+        if (idx >= imageCount || swapchainImages[idx] == VK_NULL_HANDLE) {
+            ++g_intFail;
+            if (g_intFail <= 5 || (g_intFail % 30) == 0)
+                ffxQuietLog("[FFX-DIAG] interp target unusable idx=%u imageCount=%u (fail=%llu)",
+                       idx, imageCount, (unsigned long long)g_intFail);
+            return false;
+        }
+        // 理论上 swapchain 不会把"已被主流程持有、尚未 present"的那张图再分配给我们；
+        // 万一发生，也照常使用（宁可这帧画面异常一瞬），否则这张图会被永久占住，
+        // 累积几帧后主流程就再也 acquire 不到图 —— 那才是真正的崩溃来源。
+        if (idx == mainImageIndex) {
+            ++g_intFail;
+            if (g_intFail <= 5 || (g_intFail % 30) == 0)
+                ffxQuietLog("[FFX-DIAG] WARN interp target equals main image idx=%u (fail=%llu)",
+                       idx, (unsigned long long)g_intFail);
+        }
+        g_it.cursor = (slot + 1) % kInterpSemCount;
+        *outImage = swapchainImages[idx];
+        *outIndex = idx;
+        *outAcquire = g_it.acquireSems[slot];
+        *outFinished = g_it.finishedSems[slot];
+        ++g_intOk;
+        return true;
+    }
+
+    // 返回 true 表示拷贝已录制到命令缓冲。调用方据此决定是否 present 这张图 ——
+    // 录制失败时图已经被 acquire，绝不能弄丢（否则几帧后交换链无图可用 -> ANR）。
+    bool FfxRecordInterpBlit(VkCommandBuffer cmd, VkImage dst, uint32_t width, uint32_t height) {
+        if (cmd == VK_NULL_HANDLE || dst == VK_NULL_HANDLE || !g_resReady ||
+            g_output.image == VK_NULL_HANDLE || width == 0 || height == 0) {
+            static unsigned s_blitFail = 0; ++s_blitFail;
+            if (s_blitFail <= 5 || (s_blitFail % 30) == 0)
+                ffxQuietLog("[FFX-DIAG] interp blit NOT recorded #%u (cmd=%p dst=%p resReady=%d "
+                       "output=%p %ux%u) -> caller must return the acquired image",
+                       s_blitFail, (void*)cmd, (void*)dst, g_resReady ? 1 : 0,
+                       (void*)g_output.image, width, height);
+            return false;
+        }
+
+        VkImageMemoryBarrier bars[2]{};
+        for (int i = 0; i < 2; ++i) {
+            bars[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            bars[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            bars[i].subresourceRange.baseMipLevel = 0;
+            bars[i].subresourceRange.levelCount = 1;
+            bars[i].subresourceRange.baseArrayLayer = 0;
+            bars[i].subresourceRange.layerCount = 1;
+        }
+        bars[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        bars[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        bars[0].srcAccessMask = 0;
+        bars[0].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bars[0].image = dst;
+        bars[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;   // output 由 compute 写在 GENERAL
+        bars[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        bars[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        bars[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        bars[1].image = g_output.image;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 2, bars);
+
+        VkImageBlit blit{};
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.mipLevel = 0;
+        blit.srcSubresource.baseArrayLayer = 0;
+        blit.srcSubresource.layerCount = 1;
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {static_cast<int32_t>(g_width), static_cast<int32_t>(g_height), 1};
+        blit.dstSubresource = blit.srcSubresource;
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
+        vkCmdBlitImage(cmd, g_output.image, VK_IMAGE_LAYOUT_GENERAL,
+                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_LINEAR);
+
+        VkImageMemoryBarrier toPresent = bars[0];
+        toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        toPresent.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toPresent.dstAccessMask = 0;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &toPresent);
+        return true;
+    }
+
+    // ---------------- P2：把插值帧作为额外一帧呈现 ----------------
+    // 设计要点（吸收别家踩过的坑）：
+    //   * 不重建 VkPresentInfoKHR 丢失 pNext —— 这里只做一次朴素的 present，不改主流程的包。
+    //   * 每次呈现都重新 acquire 一张新 image，不重用上一次的图 —— 避免"多次生成共用一个
+    //     描述符/槽位"导致的黑帧与闪烁。
+    //   * 任何一步失败都静默跳过，只落盘计数，绝不影响真实帧出画。
+    namespace {
+        struct PresentRes {
+            VkCommandPool pool = VK_NULL_HANDLE;
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            VkSemaphore acquireSem = VK_NULL_HANDLE;
+            VkSemaphore blitDoneSem = VK_NULL_HANDLE;
+            VkFence fence = VK_NULL_HANDLE;
+            bool tried = false;
+            bool ok = false;
+        };
+        PresentRes g_pr;
+        uint64_t g_p2Ok = 0, g_p2Fail = 0;
+
+        bool ensure_present_res(VkDevice device, uint32_t family) {
+            if (g_pr.tried) return g_pr.ok;
+            g_pr.tried = true;
+            VkCommandPoolCreateInfo pci{};
+            pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+            pci.queueFamilyIndex = family;
+            if (vkCreateCommandPool(device, &pci, nullptr, &g_pr.pool) != VK_SUCCESS) return false;
+            VkCommandBufferAllocateInfo ai{};
+            ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            ai.commandPool = g_pr.pool;
+            ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            ai.commandBufferCount = 1;
+            if (vkAllocateCommandBuffers(device, &ai, &g_pr.cmd) != VK_SUCCESS) return false;
+            VkSemaphoreCreateInfo sci{};
+            sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            if (vkCreateSemaphore(device, &sci, nullptr, &g_pr.acquireSem) != VK_SUCCESS) return false;
+            if (vkCreateSemaphore(device, &sci, nullptr, &g_pr.blitDoneSem) != VK_SUCCESS) return false;
+            VkFenceCreateInfo fci{};
+            fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            fci.flags = VK_FENCE_CREATE_SIGNALED_BIT; // 首次 wait 立即返回
+            if (vkCreateFence(device, &fci, nullptr, &g_pr.fence) != VK_SUCCESS) return false;
+            g_pr.ok = true;
+            return true;
+        }
+    }
+
+    uint32_t FfxPresentGeneratedFrame(VkDevice device, VkQueue graphicsQueue, uint32_t graphicsFamily,
+                                      VkQueue presentQueue, VkSwapchainKHR swapchain,
+                                      const VkImage* swapchainImages, uint32_t imageCount,
+                                      uint32_t width, uint32_t height, VkFence frameFence) {
+        if (!g_resReady || g_output.image == VK_NULL_HANDLE) return UINT32_MAX;
+        if (device == VK_NULL_HANDLE || swapchain == VK_NULL_HANDLE ||
+            swapchainImages == nullptr || imageCount == 0) return UINT32_MAX;
+        if (width == 0 || height == 0 || graphicsQueue == VK_NULL_HANDLE ||
+            presentQueue == VK_NULL_HANDLE) return UINT32_MAX;
+        if (!ensure_present_res(device, graphicsFamily)) return UINT32_MAX;
+
+        // 1) 等本帧主 submit 完成：output 里才是这一帧刚算好的插值结果。
+        if (frameFence != VK_NULL_HANDLE) {
+            if (vkWaitForFences(device, 1, &frameFence, VK_TRUE, 1000000000ull) != VK_SUCCESS) {
+                if ((g_p2Fail++ % 60) == 1)
+                    ffxQuietLog("[FFX-P2] wait frame fence timeout (fail=%llu)", (unsigned long long)g_p2Fail);
+                return UINT32_MAX;
+            }
+        }
+        // 上一次的 blit 必须在复用 cmd/semaphore 前完成
+        vkWaitForFences(device, 1, &g_pr.fence, VK_TRUE, 1000000000ull);
+
+        // 2) 每次呈现都 acquire 一张新的 swapchain image（不复用上一张）
+        uint32_t idx = 0;
+        const VkResult ar = vkAcquireNextImageKHR(device, swapchain, 1000000000ull,
+                                                 g_pr.acquireSem, VK_NULL_HANDLE, &idx);
+        if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+            if ((g_p2Fail++ % 60) == 1)
+                ffxQuietLog("[FFX-P2] acquire failed %d (fail=%llu)", (int)ar, (unsigned long long)g_p2Fail);
+            return UINT32_MAX;
+        }
+        if (idx >= imageCount || swapchainImages[idx] == VK_NULL_HANDLE) return UINT32_MAX;
+        const VkImage dst = swapchainImages[idx];
+
+        // 3) 录制 output -> 目标图 的拷贝
+        vkResetCommandBuffer(g_pr.cmd, 0);
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(g_pr.cmd, &bi) != VK_SUCCESS) return UINT32_MAX;
+
+        VkImageMemoryBarrier bars[2]{};
+        for (int i = 0; i < 2; ++i) {
+            bars[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            bars[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            bars[i].subresourceRange.baseMipLevel = 0;
+            bars[i].subresourceRange.levelCount = 1;
+            bars[i].subresourceRange.baseArrayLayer = 0;
+            bars[i].subresourceRange.layerCount = 1;
+        }
+        bars[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;   // 旧内容直接丢弃
+        bars[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        bars[0].srcAccessMask = 0;
+        bars[0].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bars[0].image = dst;
+        bars[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;     // output 由 compute 写在 GENERAL
+        bars[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        bars[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        bars[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        bars[1].image = g_output.image;
+        vkCmdPipelineBarrier(g_pr.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 2, bars);
+
+        // 用 blit 而不是 copy：output 是 RGBA8，swapchain 可能是 10bit（A2B10G10R10），
+        // vkCmdCopyImage 要求两端格式一致，blit 才允许做格式转换。
+        VkImageBlit blit{};
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.mipLevel = 0;
+        blit.srcSubresource.baseArrayLayer = 0;
+        blit.srcSubresource.layerCount = 1;
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
+        blit.dstSubresource = blit.srcSubresource;
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
+        vkCmdBlitImage(g_pr.cmd, g_output.image, VK_IMAGE_LAYOUT_GENERAL,
+                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_LINEAR);
+
+        VkImageMemoryBarrier toPresent = bars[0];
+        toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        toPresent.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toPresent.dstAccessMask = 0;
+        vkCmdPipelineBarrier(g_pr.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &toPresent);
+        if (vkEndCommandBuffer(g_pr.cmd) != VK_SUCCESS) return UINT32_MAX;
+
+        // 4) 提交：等新图的 acquire 信号，完成后发 blitDone
+        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &g_pr.acquireSem;
+        si.pWaitDstStageMask = &waitStage;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &g_pr.cmd;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &g_pr.blitDoneSem;
+        vkResetFences(device, 1, &g_pr.fence);
+        if (vkQueueSubmit(graphicsQueue, 1, &si, g_pr.fence) != VK_SUCCESS) {
+            if ((g_p2Fail++ % 60) == 1) ffxQuietLog("[FFX-P2] submit failed (fail=%llu)", (unsigned long long)g_p2Fail);
+            return UINT32_MAX;
+        }
+
+        // 5) 呈现这一帧
+        VkPresentInfoKHR pi{};
+        pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &g_pr.blitDoneSem;
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &swapchain;
+        pi.pImageIndices = &idx;
+        const VkResult pr = vkQueuePresentKHR(presentQueue, &pi);
+        if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) {
+            if ((g_p2Fail++ % 60) == 1)
+                ffxQuietLog("[FFX-P2] present failed %d (fail=%llu)", (int)pr, (unsigned long long)g_p2Fail);
+            return UINT32_MAX;
+        }
+        ++g_p2Ok;
+        if (g_p2Ok == 1 || (g_p2Ok % 120) == 0)
+            ffxQuietLog("[FFX-P2] presented %llu interpolated frames (fail=%llu)",
+                   (unsigned long long)g_p2Ok, (unsigned long long)g_p2Fail);
+        return idx;
+    }
+// FusionGL FusionSR 超分 —— 追加到 FfxProbe.cpp namespace 内
+// Catmull-Rom 空间放大 + 时间帧积累 + RCAS 风格锐化。无 motion / depth / 光影依赖。
+namespace US {
+    static bool s_init = false, s_failed = false;
+    static VkSampler s_sampler = VK_NULL_HANDLE;
+    static VkDescriptorSetLayout s_dslU = VK_NULL_HANDLE, s_dslS = VK_NULL_HANDLE;
+    static VkPipelineLayout s_plU = VK_NULL_HANDLE, s_plS = VK_NULL_HANDLE;
+    static VkPipeline s_pipeU = VK_NULL_HANDLE, s_pipeS = VK_NULL_HANDLE;
+    static VkDescriptorPool s_pool = VK_NULL_HANDLE;
+    static VkDescriptorSet s_setU[2] = {}, s_setS = {};
+    static VkBuffer s_cb = VK_NULL_HANDLE; static VkDeviceMemory s_cbm = VK_NULL_HANDLE; static void* s_cbmap = nullptr;
+    struct H { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
+    static H s_hist[2];
+    static H s_upOut;
+    static uint32_t s_rw = 0, s_rh = 0, s_w = 0, s_h = 0;
+    static int s_par = 0;
+    static VkImageView s_srcView = VK_NULL_HANDLE, s_outView = VK_NULL_HANDLE;
+    static VkImage s_srcCached = VK_NULL_HANDLE, s_outCached = VK_NULL_HANDLE;
+
+    static uint32_t mt(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags want) {
+        VkPhysicalDeviceMemoryProperties mp{}; vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+            if ((bits & (1u<<i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
+        return UINT32_MAX;
+    }
+    static VkPipeline makePipe(VkDevice dev, const uint32_t* code, size_t words,
+                               VkDescriptorSetLayout dsl, VkPipelineLayout& pl) {
+        VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        sci.codeSize = words*4; sci.pCode = code;
+        VkShaderModule m = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(dev, &sci, nullptr, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1; pli.pSetLayouts = &dsl;
+        VkPushConstantRange pcr{}; pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; pcr.size = 32;
+        pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+        if (vkCreatePipelineLayout(dev, &pli, nullptr, &pl) != VK_SUCCESS) { vkDestroyShaderModule(dev,m,nullptr); return VK_NULL_HANDLE; }
+        VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = m; cpi.stage.pName = "main";
+        cpi.layout = pl;
+        VkPipeline p = VK_NULL_HANDLE; vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &p);
+        vkDestroyShaderModule(dev, m, nullptr);
+        return p;
+    }
+    static bool init(VkDevice dev, VkPhysicalDevice pd) {
+        if (s_init || s_failed) return s_init;
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+        sci.addressModeU = sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        if (vkCreateSampler(dev, &sci, nullptr, &s_sampler) != VK_SUCCESS) { s_failed = true; return false; }
+        // upsample set: 0 sampler(src), 1 sampler(hist), 2 storage image(out)
+        {
+            VkDescriptorSetLayoutBinding b[3]{};
+            b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            b[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            VkDescriptorSetLayoutCreateInfo l{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            l.bindingCount = 3; l.pBindings = b;
+            if (vkCreateDescriptorSetLayout(dev, &l, nullptr, &s_dslU) != VK_SUCCESS) { s_failed=true; return false; }
+        }
+        // sharpen set: 0 sampler(in), 1 storage image(out)
+        {
+            VkDescriptorSetLayoutBinding b[2]{};
+            b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            VkDescriptorSetLayoutCreateInfo l{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            l.bindingCount = 2; l.pBindings = b;
+            if (vkCreateDescriptorSetLayout(dev, &l, nullptr, &s_dslS) != VK_SUCCESS) { s_failed=true; return false; }
+        }
+        s_pipeU = makePipe(dev, fusion_sr_upsample_spv, sizeof(fusion_sr_upsample_spv)/4, s_dslU, s_plU);
+        s_pipeS = makePipe(dev, fusion_sr_sharpen_spv, sizeof(fusion_sr_sharpen_spv)/4, s_dslS, s_plS);
+        if (!s_pipeU || !s_pipeS) { s_failed = true; return false; }
+        VkDescriptorPoolSize ps[3] = {
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+        };
+        VkDescriptorPoolCreateInfo pc{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pc.maxSets = 5; pc.poolSizeCount = 3; pc.pPoolSizes = ps;
+        if (vkCreateDescriptorPool(dev, &pc, nullptr, &s_pool) != VK_SUCCESS) { s_failed=true; return false; }
+        // push constant buffer (dummy, for descriptor 3 in shader — shader uses push, not UBO; keep for safety)
+        VkBufferCreateInfo bc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bc.size = 256; bc.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        if (vkCreateBuffer(dev, &bc, nullptr, &s_cb) == VK_SUCCESS) {
+            VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(dev, s_cb, &mr);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = mr.size; ai.memoryTypeIndex = mt(pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (ai.memoryTypeIndex != UINT32_MAX && vkAllocateMemory(dev, &ai, nullptr, &s_cbm) == VK_SUCCESS) {
+                vkBindBufferMemory(dev, s_cb, s_cbm, 0); vkMapMemory(dev, s_cbm, 0, 256, 0, &s_cbmap);
+            }
+        }
+        auto allocSet = [&](VkDescriptorSetLayout l, VkDescriptorSet& s) {
+            VkDescriptorSetAllocateInfo a{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            a.descriptorPool = s_pool; a.descriptorSetCount = 1; a.pSetLayouts = &l;
+            return vkAllocateDescriptorSets(dev, &a, &s) == VK_SUCCESS;
+        };
+        if (!allocSet(s_dslU, s_setU[0]) || !allocSet(s_dslU, s_setU[1]) || !allocSet(s_dslS, s_setS)) { s_failed=true; return false; }
+        s_init = true;
+        ffxQuietLog("[FFX-UP] pipelines ready (Catmull-Rom + temporal + sharpen)");
+        return true;
+    }
+    static void makeHist(uint32_t w, uint32_t h) {
+        for (int i = 0; i < 2; ++i) {
+            VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ci.imageType = VK_IMAGE_TYPE_2D; ci.format = VK_FORMAT_R8G8B8A8_UNORM; ci.extent = {w,h,1};
+            ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT;
+            ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            vkCreateImage(g_device, &ci, nullptr, &s_hist[i].img);
+            VkMemoryRequirements mr{}; vkGetImageMemoryRequirements(g_device, s_hist[i].img, &mr);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = mr.size; ai.memoryTypeIndex = mt(g_physicalDevice, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            vkAllocateMemory(g_device, &ai, nullptr, &s_hist[i].mem);
+            vkBindImageMemory(g_device, s_hist[i].img, s_hist[i].mem, 0);
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = s_hist[i].img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+            vkCreateImageView(g_device, &vi, nullptr, &s_hist[i].view);
+        }
+    }
+    static void bar(VkCommandBuffer c, VkImage im, VkImageLayout ol, VkImageLayout nl,
+                    VkAccessFlags sa, VkAccessFlags da, VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout=ol; b.newLayout=nl; b.image=im; b.srcAccessMask=sa; b.dstAccessMask=da;
+        b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+        vkCmdPipelineBarrier(c, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
+    }
+}
+
+bool FfxUpscaleEnabled() {
+    static int c = -1;
+    if (c < 0) { const char* e = std::getenv("FUSION_UPSCALE_PCT"); int p = e ? std::atoi(e) : 100; c = (e && p > 0 && p < 100) ? 1 : 0; }
+    return c == 1;
+}
+
+bool FfxUpscaleRecord(VkCommandBuffer cmd, VkImage src, VkImage out,
+                      uint32_t rw, uint32_t rh, uint32_t w, uint32_t h, bool reset) {
+    if (!FfxUpscaleEnabled()) return false;
+    if (cmd == VK_NULL_HANDLE || src == VK_NULL_HANDLE || out == VK_NULL_HANDLE) {
+        FFXLOG("[FFX-UP][CHECK] record reject: cmd=%p src=%p out=%p", (void*)cmd,(void*)src,(void*)out);
+        return false;
+    }
+    if (US::s_failed) return false;
+    if (!US::init(g_device, g_physicalDevice)) return false;
+    if (rw != US::s_rw || rh != US::s_rh || w != US::s_w || h != US::s_h) {
+        vkDeviceWaitIdle(g_device);
+        for (int i=0;i<2;++i) {
+            if (US::s_hist[i].view) vkDestroyImageView(g_device, US::s_hist[i].view, nullptr);
+            if (US::s_hist[i].img) vkDestroyImage(g_device, US::s_hist[i].img, nullptr);
+            if (US::s_hist[i].mem) vkFreeMemory(g_device, US::s_hist[i].mem, nullptr);
+            US::s_hist[i] = {};
+        }
+        // 修复内存泄露: 尺寸变化时旧 s_upOut 必须一并释放(旧代码漏掉, 小屏->大屏
+        // 每次切换泄漏一张全屏图+显存, 切几次就触发系统内存异常弹窗)。
+        if (US::s_upOut.view) { vkDestroyImageView(g_device, US::s_upOut.view, nullptr); US::s_upOut.view = VK_NULL_HANDLE; }
+        if (US::s_upOut.img)  { vkDestroyImage(g_device, US::s_upOut.img, nullptr);     US::s_upOut.img  = VK_NULL_HANDLE; }
+        if (US::s_upOut.mem)  { vkFreeMemory(g_device, US::s_upOut.mem, nullptr);       US::s_upOut.mem  = VK_NULL_HANDLE; }
+        US::s_srcCached = US::s_outCached = VK_NULL_HANDLE;  // 图重建后 view 缓存失效
+        US::makeHist(w, h);
+        US::s_rw=rw; US::s_rh=rh; US::s_w=w; US::s_h=h; US::s_par=0;
+        ffxQuietLog("[FFX-UP] resources %ux%u -> %ux%u (2x history)", rw, rh, w, h);
+    }
+    // 修复内存泄露: 只在图像句柄变化时重建 view, 不再每帧 destroy/create。
+    // (swapchain 图索引轮换 src 会变; out=upOut 固定, 只建一次)
+    auto mkview = [&](VkImage im, VkImageView& v, VkImage& cached) {
+        if (v != VK_NULL_HANDLE && cached == im) return true;  // 复用已有 view
+        if (v) { vkDestroyImageView(g_device, v, nullptr); v = VK_NULL_HANDLE; }
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image=im; vi.viewType=VK_IMAGE_VIEW_TYPE_2D; vi.format=VK_FORMAT_R8G8B8A8_UNORM;
+        vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+        if (vkCreateImageView(g_device,&vi,nullptr,&v)!=VK_SUCCESS) return false;
+        cached = im;
+        return true;
+    };
+    if (!mkview(src, US::s_srcView, US::s_srcCached)) { FFXLOG("[FFX-UP][CHECK] mkview src FAILED"); return false; }
+    if (!mkview(out, US::s_outView, US::s_outCached)) { FFXLOG("[FFX-UP][CHECK] mkview upOut FAILED"); return false; }
+
+    int cur = US::s_par, prev = 1 - cur;
+    US::bar(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    US::bar(cmd, out, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    US::bar(cmd, US::s_hist[prev].img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    VkDescriptorImageInfo di[2] = {
+        {US::s_sampler, US::s_srcView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {US::s_sampler, US::s_hist[prev].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+    };
+    VkDescriptorImageInfo dh = {VK_NULL_HANDLE, US::s_hist[cur].view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wrU[3]{};
+    wrU[0].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wrU[0].dstSet=US::s_setU[cur]; wrU[0].dstBinding=0; wrU[0].descriptorCount=1; wrU[0].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wrU[0].pImageInfo=&di[0];
+    wrU[1].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wrU[1].dstSet=US::s_setU[cur]; wrU[1].dstBinding=1; wrU[1].descriptorCount=1; wrU[1].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wrU[1].pImageInfo=&di[1];
+    wrU[2].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wrU[2].dstSet=US::s_setU[cur]; wrU[2].dstBinding=2; wrU[2].descriptorCount=1; wrU[2].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wrU[2].pImageInfo=&dh;
+    vkUpdateDescriptorSets(g_device, 3, wrU, 0, nullptr);
+    float pu[8] = {1.0f/rw, 1.0f/rh, 1.0f/w, 1.0f/h, 0.75f, reset?1.0f:0.0f, 0.f, 0.f};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, US::s_pipeU);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, US::s_plU, 0, 1, &US::s_setU[cur], 0, nullptr);
+    vkCmdPushConstants(cmd, US::s_plU, VK_SHADER_STAGE_COMPUTE_BIT, 0, 24, pu);
+    vkCmdDispatch(cmd, (w+7)/8, (h+7)/8, 1);
+
+    US::bar(cmd, US::s_hist[cur].img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    VkDescriptorImageInfo si = {US::s_sampler, US::s_hist[cur].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo so = {VK_NULL_HANDLE, US::s_outView, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet sw[2]{};
+    sw[0].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; sw[0].dstSet=US::s_setS; sw[0].dstBinding=0; sw[0].descriptorCount=1; sw[0].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; sw[0].pImageInfo=&si;
+    sw[1].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; sw[1].dstSet=US::s_setS; sw[1].dstBinding=1; sw[1].descriptorCount=1; sw[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; sw[1].pImageInfo=&so;
+    vkUpdateDescriptorSets(g_device, 2, sw, 0, nullptr);
+    float ps[8] = {1.0f/w, 1.0f/h, 0.35f, 0.f};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, US::s_pipeS);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, US::s_plS, 0, 1, &US::s_setS, 0, nullptr);
+    vkCmdPushConstants(cmd, US::s_plS, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, ps);
+    vkCmdDispatch(cmd, (w+7)/8, (h+7)/8, 1);
+
+    US::s_par = 1 - cur;
+    static int s_frames = 0;
+    if (++s_frames == 1 || s_frames % 120 == 0)
+        ffxQuietLog("[FFX-UP] generated %d upscaled frames ok", s_frames);
+    return true;
+}
+
+VkImage FfxUpscaleOutputImage() { return US::s_upOut.img; }
+
+void FfxDiagLogUpscale(const char* fmt, ...) {
+    char buf[512]; va_list ap; va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    __android_log_print(ANDROID_LOG_INFO, "FusionGL-Upscale", "%s", buf);
+    if (FILE* fp = std::fopen("/sdcard/FusionGL/ffx_probe.log", "a")) {
+        std::fprintf(fp, "[FFX-UP]%s\n", buf); std::fclose(fp);
+    }
+}
+
+} // namespace MobileGL::MG_Backend::DirectVulkan
