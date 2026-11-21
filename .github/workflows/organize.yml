@@ -1,0 +1,28 @@
+name: organize
+on: push
+permissions:
+  contents: write
+jobs:
+  organize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: reorganize
+        run: |
+          set -e
+          mkdir -p src docs licenses
+          for f in FfxProbe.cpp FfxProbe.h VulkanRendererDevice.cpp VulkanRendererInternal.h VulkanRendererPipeline.cpp VulkanRendererPresent.cpp build_release.sh fusion_sr_sharpen.comp fusion_sr_sharpen_spv.h fusion_sr_upsample.comp fusion_sr_upsample_spv.h repack_release.py shader_compile.cpp; do
+            if [ -f "$f" ]; then mv -f "$f" src/; fi
+          done
+          for f in diff-Device.patch diff-FfxProbe.patch diff-Pipeline.patch diff-Present.patch; do
+            if [ -f "$f" ]; then mv -f "$f" docs/; fi
+          done
+          for f in COPYING COPYING.LESSER NG-GL4ES-LICENSE.txt Apache-2.0-SPIRV-Cross.txt; do
+            if [ -f "$f" ]; then mv -f "$f" licenses/; fi
+          done
+          rm -f .github/workflows/organize.yml
+          git config user.name Aevair
+          git config user.email aevair@users.noreply.github.com
+          git add -A
+          git commit -m "整理源码结构：src / docs / licenses" || true
+          git push
