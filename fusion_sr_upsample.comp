@@ -1,0 +1,54 @@
+#version 450
+// FusionSR Pass A: Catmull-Rom 双三次放大 + 时间积累（展开 16 tap，无循环）。
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D uSrc;
+layout(binding = 1) uniform sampler2D uHist;
+layout(binding = 2, rgba8) uniform image2D uOut;
+layout(binding = 3) uniform Params {
+    vec2 invSrc;
+    vec2 invDst;
+    float blend;
+    float reset;
+};
+
+vec4 crw(float f) {
+    float f2 = f * f, f3 = f2 * f;
+    return vec4(-0.5*f3 + f2 - 0.5*f, 1.5*f3 - 2.5*f2 + 1.0,
+                -1.5*f3 + 2.0*f2 + 0.5*f, 0.5*f3 - 0.5*f2);
+}
+vec3 bicubic(sampler2D tex, vec2 uv, vec2 texel) {
+    vec2 p = uv / texel - 0.5;
+    vec2 i = floor(p);
+    vec2 f = p - i;
+    vec4 wx = crw(f.x), wy = crw(f.y);
+    vec3 c = vec3(0.0);
+    c += texture(tex, (i + vec2(-1.0,-1.0) + 0.5) * texel).rgb * wx.x * wy.x;
+    c += texture(tex, (i + vec2( 0.0,-1.0) + 0.5) * texel).rgb * wx.y * wy.x;
+    c += texture(tex, (i + vec2( 1.0,-1.0) + 0.5) * texel).rgb * wx.z * wy.x;
+    c += texture(tex, (i + vec2( 2.0,-1.0) + 0.5) * texel).rgb * wx.w * wy.x;
+    c += texture(tex, (i + vec2(-1.0, 0.0) + 0.5) * texel).rgb * wx.x * wy.y;
+    c += texture(tex, (i + vec2( 0.0, 0.0) + 0.5) * texel).rgb * wx.y * wy.y;
+    c += texture(tex, (i + vec2( 1.0, 0.0) + 0.5) * texel).rgb * wx.z * wy.y;
+    c += texture(tex, (i + vec2( 2.0, 0.0) + 0.5) * texel).rgb * wx.w * wy.y;
+    c += texture(tex, (i + vec2(-1.0, 1.0) + 0.5) * texel).rgb * wx.x * wy.z;
+    c += texture(tex, (i + vec2( 0.0, 1.0) + 0.5) * texel).rgb * wx.y * wy.z;
+    c += texture(tex, (i + vec2( 1.0, 1.0) + 0.5) * texel).rgb * wx.z * wy.z;
+    c += texture(tex, (i + vec2( 2.0, 1.0) + 0.5) * texel).rgb * wx.w * wy.z;
+    c += texture(tex, (i + vec2(-1.0, 2.0) + 0.5) * texel).rgb * wx.x * wy.w;
+    c += texture(tex, (i + vec2( 0.0, 2.0) + 0.5) * texel).rgb * wx.y * wy.w;
+    c += texture(tex, (i + vec2( 1.0, 2.0) + 0.5) * texel).rgb * wx.z * wy.w;
+    c += texture(tex, (i + vec2( 2.0, 2.0) + 0.5) * texel).rgb * wx.w * wy.w;
+    return clamp(c, 0.0, 1.0);
+}
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(uOut);
+    if (o.x >= sz.x || o.y >= sz.y) return;
+    vec2 uv = (vec2(o) + 0.5) * invDst;
+    vec3 spatial = bicubic(uSrc, uv, invSrc);
+    vec3 history = texture(uHist, uv).rgb;
+    float diff = dot(abs(spatial - history), vec3(0.299, 0.587, 0.114));
+    float w = blend * exp(-diff * 12.0) * (1.0 - reset);
+    w = clamp(w, 0.0, 0.92);
+    imageStore(uOut, o, vec4(mix(spatial, history, w), 1.0));
+}

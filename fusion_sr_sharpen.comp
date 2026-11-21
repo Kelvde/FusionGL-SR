@@ -1,0 +1,32 @@
+#version 450
+// FusionSR 超分 Pass B: RCAS 风格自适应锐化（无需 motion vector）。
+// 输入高分辨率重建图，输出锐化后的最终图。
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D uIn;
+layout(binding = 1, rgba8) uniform image2D uOut;
+layout(binding = 2) uniform Sharp {
+    vec2 invSize;
+    float sharpness; // 0..1
+    float pad;
+};
+
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(uOut);
+    if (o.x >= sz.x || o.y >= sz.y) return;
+    vec2 uv = (vec2(o) + 0.5) * invSize;
+    vec2 t = invSize;
+
+    vec3 c  = texture(uIn, uv).rgb;
+    vec3 n  = texture(uIn, uv + vec2(0.0, -t.y)).rgb;
+    vec3 s  = texture(uIn, uv + vec2(0.0,  t.y)).rgb;
+    vec3 e  = texture(uIn, uv + vec2( t.x, 0.0)).rgb;
+    vec3 w  = texture(uIn, uv + vec2(-t.x, 0.0)).rgb;
+    vec3 mx = max(max(n, s), max(e, w));
+    vec3 mn = min(min(n, s), min(e, w));
+    // 局部对比度自适应锐化，钳制到邻域范围防过冲
+    vec3 sharp = c + (c - (n + s + e + w) * 0.25) * sharpness * 2.0;
+    sharp = clamp(sharp, mn, mx);
+    imageStore(uOut, o, vec4(sharp, 1.0));
+}
