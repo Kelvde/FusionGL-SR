@@ -1,0 +1,44 @@
+--- upstream-baseline/VulkanRendererDevice.cpp	2026-11-18 01:50:04.000000000 +0800
++++ src/VulkanRendererDevice.cpp	2026-11-18 18:14:14.642569197 +0800
+@@ -2139,35 +2139,12 @@
+         auto* nativeWindow = static_cast<ANativeWindow*>(m_window);
+         if (!nativeWindow) throw RuntimeError("ANativeWindowType is null");
+ 
+-        // FusionGL 超分（线程A）：把 surface 的 buffer 逻辑尺寸按 FUSION_UPSCALE_PCT 缩小。
+-        // Android 合成器会自动把较小的 buffer 拉伸到全屏 View —— 整条渲染管线（帧缓冲、
+-        // 视口、swapchain currentExtent）自动跟随变小，GPU 渲染量按比例直降，放大零成本。
+-        // 只在环境变量存在且 <100% 时生效；正式版（无该选项）不受影响。设置失败只是
+-        // 超分不生效，绝不阻断渲染器初始化。
+-        {
+-            const char* pctEnv = std::getenv("FUSION_UPSCALE_PCT");
+-            if (pctEnv && pctEnv[0] != '\0') {
+-                // 容忍 "75%"、"75" 两种写法：取前导数字。
+-                int pct = std::atoi(pctEnv);
+-                if (pct > 0 && pct < 100) {
+-                    const int32_t w = ANativeWindow_getWidth(nativeWindow);
+-                    const int32_t h = ANativeWindow_getHeight(nativeWindow);
+-                    const int32_t fmt = ANativeWindow_getFormat(nativeWindow);
+-                    const int32_t nw = static_cast<int32_t>(static_cast<int64_t>(w) * pct / 100);
+-                    const int32_t nh = static_cast<int32_t>(static_cast<int64_t>(h) * pct / 100);
+-                    if (nw > 0 && nh > 0) {
+-                        const int32_t rc = ANativeWindow_setBuffersGeometry(nativeWindow, nw, nh, fmt);
+-                        MGLOG_I("FusionGL upscale: buffers %dx%d -> %dx%d (pct=%d%% rc=%d)",
+-                                w, h, nw, nh, pct, static_cast<int>(rc));
+-                        if (rc != 0)
+-                            MGLOG_E("FusionGL upscale: setBuffersGeometry failed (rc=%d) - "
+-                                    "continuing at native resolution", static_cast<int>(rc));
+-                    }
+-                }
+-            }
+-        }
+-
+-        VkAndroidSurfaceCreateInfoKHR sci{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
++                // FusionGL 链路B已移除：不再缩 surface buffer —— buffer 恒全屏(2780x1264),
++        // 显示域与鼠标输入域一致, 杜绝指针错位(实测确认的 bug, Pojav 生态共病)。
++        // 降负载改由 viewport 缩放(链路A, MC 内部几何安全)承担,
++        // 87.5% 区域画面由超分 pass 重建到全屏 buffer。
++        // (原 setBuffersGeometry 段已整体移除)
++VkAndroidSurfaceCreateInfoKHR sci{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
+         sci.window = nativeWindow;
+         const VkResult androidSurfaceResult = vkCreateAndroidSurfaceKHR(m_instance, &sci, nullptr, &m_surface);
+         if (androidSurfaceResult != VK_SUCCESS) {
